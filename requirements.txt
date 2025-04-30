@@ -1,0 +1,6 @@
+tensorflow
+websockets
+pandas
+requests
+scikit-learn
+tqdm 

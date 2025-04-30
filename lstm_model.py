@@ -19,3 +19,4 @@ def build_lstm_model(input_shape):
     ])
     model.compile(optimizer='adam', loss='mse')
     return model
+

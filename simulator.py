@@ -105,6 +105,14 @@ num_losses = len(result_df) - num_wins
 print(f"✅ 수익 낸 거래 수: {int(num_wins)}회")
 print(f"❌ 손실 낸 거래 수: {int(num_losses)}회")
 
+long_df = result_df[result_df["direction"] == "long"]
+short_df = result_df[result_df["direction"] == "short"]
+long_profit = long_df["pnl(%)"].sum()
+short_profit = short_df["pnl(%)"].sum()
+print(f"\n📊 전략별 총 수익률:")
+print(f"🔺 롱 수익률 합계: {long_profit:.2f}%")
+print(f"🔻 숏 수익률 합계: {short_profit:.2f}%")
+
 # 수익률 분포 시각화
 import matplotlib.pyplot as plt
 plt.figure(figsize=(10, 4))

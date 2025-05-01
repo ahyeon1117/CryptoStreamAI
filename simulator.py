@@ -1,120 +1,143 @@
-import tensorflow as tf
-print("✅ GPU 사용 가능 여부:", tf.config.list_physical_devices('GPU'))
-
-from collector import get_binance_ohlcv
-from lstm_model import build_lstm_model, create_sequences, scaler
 import numpy as np
+import pandas as pd
 import csv
 from tqdm import tqdm
-
-# 시각화용 폰트 설정 (한글 깨짐 방지)
 import matplotlib.pyplot as plt
+from lstm_model import build_lstm_model, create_sequences, scaler
+from collector import get_binance_ohlcv
+import tensorflow as tf
+
+# ✅ 폰트 설정 (맑은 고딕)
 plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
 
-# 1. Load data and train model
-df = get_binance_ohlcv(days=7)
-prices = df['close'].values.reshape(-1, 1)
-scaled = scaler.fit_transform(prices)
-X, y = create_sequences(scaled)
-model = build_lstm_model((X.shape[1], 1))
-model.fit(X, y, epochs=20, batch_size=248)  # GPU 성능 활용을 위한 배치 최적화  # 더 많은 학습으로 정확도 향상
+# ✅ 1. 데이터 준비 (한 달치 데이터)
+df = get_binance_ohlcv(days=14)
+train_df = df.iloc[:-1440*7]  # 최근 7일 전까지
 
-# 2. Run simulation (optimized with batch prediction)
-results = []
+# 최근 7일을 테스트로 사용
+test_df = df.iloc[-1440*7:]
+
+# ✅ 2. 모델 학습
+train_prices = train_df['close'].values.reshape(-1, 1)
+scaled = scaler.fit_transform(train_prices)
+X, y = create_sequences(scaled)
+
+# 개선된 모델 구조 적용
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+
+model = Sequential([
+    LSTM(64, return_sequences=True, input_shape=(X.shape[1], 1)),
+    Dropout(0.2),
+    LSTM(32, return_sequences=False),
+    Dropout(0.2),
+    Dense(1)
+])
+model.compile(optimizer='adam', loss='mae')
+model.fit(X, y, epochs=30, batch_size=512)
+
+# ✅ 3. 테스트 및 시뮬레이션 수행
 initial_balance = 1000.0
 balance = initial_balance
 position_size = 100  # USD
-leverage = 100  # ⚖️ 50x leverage for more realistic risk
-stop_loss_pct = 0.01  # 손절 기준을 강화하여 리스크를 더 줄임  # 손절 기준도 조금 더 유연하게 조정  # 2% 손절 기준
+leverage = 15
+stop_loss_pct = 0.01
+take_profit_pct = 0.05
+entry_threshold = 0.002
+fee_rate = 0.001
 
-# Prepare sequences for batch prediction
-sim_inputs = []
-currents = []
-futures = []
-timestamps = []
+# 테스트 데이터 준비
+test_prices = test_df['close'].values.reshape(-1, 1)
+timestamps = test_df['timestamp'].values
+scaled_test = scaler.transform(test_prices)
+input_seqs = []
 
-for i in range(60, len(prices) - 3):
-    seq = prices[i-60:i]
-    current = float(prices[i][0])
-    future = float(prices[i+3][0])
-    scaled_seq = scaler.transform(seq)
-    sim_inputs.append(scaled_seq)
-    currents.append(current)
-    futures.append(future)
-    timestamps.append(df['timestamp'].iloc[i])
+for i in range(60, len(test_prices) - 15):
+    input_seqs.append(scaled_test[i - 60:i])
 
-sim_inputs = np.array(sim_inputs)
-preds = model.predict(sim_inputs, verbose=0)
-preds = scaler.inverse_transform(preds)
+input_seqs = np.array(input_seqs)
+preds = model.predict(input_seqs, verbose=0)
 
-for i in tqdm(range(len(sim_inputs)), desc="Simulating", unit="step"):
+results = []
+entry_times = []
+exit_times = []
+
+for i in tqdm(range(len(input_seqs)), desc="Simulating", unit="step"):
+    current = float(test_prices[i][0])
+    future = float(test_prices[i+15][0])  # 15분 후
     pred = preds[i][0]
-    current = currents[i]
-    future = futures[i]
-    expected_pct = (pred - current) / current
+    pred = scaler.inverse_transform([[pred]])[0][0]
 
-    if expected_pct >= 0.0025:
+    expected_pct = ((pred - current) / current) * 2
+
+    if i < 60:
+        continue
+
+    ma_60 = np.mean(test_prices[i-60:i])
+    ma_10 = np.mean(test_prices[i-10:i])
+
+    if expected_pct >= entry_threshold and current > ma_60 and ma_10 > ma_60:
         direction = "long"
         raw_pct = (future - current) / current
-        pnl_pct = max(raw_pct, -stop_loss_pct)
-    elif expected_pct <= -0.0025:
-        direction = "short"
-        raw_pct = (current - future) / current
-        pnl_pct = max(raw_pct, -stop_loss_pct)
+        pnl_pct = max(min(raw_pct, take_profit_pct), -stop_loss_pct)
     else:
         continue
 
-    is_liquidated = pnl_pct == -stop_loss_pct
-    pnl = pnl_pct * position_size * leverage
+    pnl_pct_after_fee = pnl_pct - fee_rate
+    is_liquidated = pnl_pct_after_fee <= -stop_loss_pct
+    pnl = pnl_pct_after_fee * position_size * leverage
     balance += pnl
+
+    entry_times.append(pd.to_datetime(timestamps[i]))
+    exit_times.append(pd.to_datetime(timestamps[i + 15]))
+
     results.append([
         timestamps[i],
         current,
         future,
-        pnl_pct * 100 * leverage,
+        pnl_pct_after_fee * 100 * leverage,
         direction,
         pnl > 0,
         round(balance, 2),
         is_liquidated
     ])
 
-# 3. Save results
-import pandas as pd
-
+# ✅ 4. 결과 저장 및 분석
 with open("sim_result.csv", "w", newline='') as f:
     writer = csv.writer(f)
     writer.writerow(["timestamp", "entry", "exit", "pnl(%)", "direction", "hit", "balance", "liquidated"])
     writer.writerows(results)
 
-# 4. Analyze liquidations, losses, and profit distribution
 result_df = pd.read_csv("sim_result.csv")
-num_liquidated = result_df["liquidated"].sum()
-print(f"❌ 청산된 횟수: {int(num_liquidated)}회")
+print(f"❌ 청산된 횟수: {int(result_df['liquidated'].sum())}회")
 
-# 손실 집계
 loss_trades = result_df[result_df["pnl(%)"] < 0]
 total_loss = loss_trades["pnl(%)"].sum()
 avg_loss = loss_trades["pnl(%)"].mean()
 print(f"💸 총 손실률 합계: {total_loss:.2f}%")
 print(f"📉 평균 손실률: {avg_loss:.2f}%")
 
-# 승/패 집계
 num_wins = result_df["hit"].sum()
 num_losses = len(result_df) - num_wins
 print(f"✅ 수익 낸 거래 수: {int(num_wins)}회")
 print(f"❌ 손실 낸 거래 수: {int(num_losses)}회")
 
 long_df = result_df[result_df["direction"] == "long"]
-short_df = result_df[result_df["direction"] == "short"]
-long_profit = long_df["pnl(%)"].sum()
-short_profit = short_df["pnl(%)"].sum()
-print(f"\n📊 전략별 총 수익률:")
-print(f"🔺 롱 수익률 합계: {long_profit:.2f}%")
-print(f"🔻 숏 수익률 합계: {short_profit:.2f}%")
+print(f"🔺 롱 수익률 합계: {long_df['pnl(%)'].sum():.2f}%")
 
-# 수익률 분포 시각화
-import matplotlib.pyplot as plt
+# 💀 청산 확률 계산
+num_liquidated = result_df[result_df['liquidated']].shape[0]
+total_trades = len(result_df)
+print(f"💀 청산 확률: {(num_liquidated / total_trades * 100):.2f}%" if total_trades else "💀 청산 확률: 계산 불가")
+
+# 📊 평균 보유 시간
+if entry_times and exit_times:
+    holding_durations = [(exit - entry).total_seconds() / 60 for entry, exit in zip(entry_times, exit_times)]
+    avg_holding_time = sum(holding_durations) / len(holding_durations)
+    print(f"⏱️ 평균 포지션 보유 시간: {avg_holding_time:.2f}분")
+
+# 시각화
 plt.figure(figsize=(10, 4))
 plt.hist(result_df["pnl(%)"], bins=30, color="skyblue", edgecolor="black")
 plt.title("수익률 분포 Histogram")
@@ -124,7 +147,6 @@ plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-# 수익 곡선 (잔고 변화)
 plt.figure(figsize=(10, 4))
 plt.plot(result_df["balance"], label="Balance", color="green")
 plt.title("잔고 추이 (Balance Over Time)")

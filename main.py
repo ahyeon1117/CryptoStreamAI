@@ -1,117 +1,175 @@
+# main.py
+
+import os
+import sys
 import asyncio
 import websockets
+import websockets.exceptions
 import json
 import numpy as np
 import csv
+import socket
 from datetime import datetime, timezone
-from lstm_model import build_lstm_model, create_sequences, scaler
+from lstm_model import create_sequences, scaler, build_lstm_model
 from collector import get_binance_ohlcv
 import tensorflow as tf
+import platform
 
-# ✅ GPU 사용 확인
+# ───────────────────────────────────────────────────────────────────────────────
+# 상수 설정 (주석으로 역할 설명)
+WINDOW_SIZE          = 60               # LSTM 입력 시퀀스 길이
+SHORT_MA_WINDOW      = 5                # 단기 MA 기간
+LONG_MA_WINDOW       = 20               # 장기 MA 기간
+LEVERAGE             = 15               # 가정 레버리지 배율
+STOP_LOSS_PCT        = 0.01             # 손절 기준 (1%)
+TAKE_PROFIT_PCT      = 0.03             # 익절 기준 (3%)
+ENTRY_THRESHOLD_BASE = 0.0002           # 기본 진입 임계 (0.02%)
+FEE_RATE             = 0.001            # 수수료 (0.1%)
+MAX_HOLDING_MINUTES  = 120              # 최대 보유 시간 (분)
+EPOCHS               = 30               # 학습 에포크
+BATCH_SIZE           = 512              # 학습 배치 크기
+LOG_PATH             = "trade_log.csv"   # 로그 파일 경로
+MODEL_PATH           = "lstm_model.h5"   # 모델 가중치 파일 경로
+RECONNECT_DELAY      = 5                # 재연결 대기 시간 (초)
+PING_INTERVAL_SEC    = 20               # 수동 ping 주기 (초)
+# ───────────────────────────────────────────────────────────────────────────────
+
+if platform.system() == "Windows":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 print("✅ GPU 사용 가능 여부:", tf.config.list_physical_devices('GPU'))
 
-# ✅ 모델 학습
-df = get_binance_ohlcv(days=7)
-prices = df['close'].values.reshape(-1, 1)
-scaled = scaler.fit_transform(prices)
-X, y = create_sequences(scaled)
-model = build_lstm_model((X.shape[1], 1))
-model.fit(X, y, epochs=20, batch_size=248)
+def train_model():
+    df = get_binance_ohlcv(days=90)
+    prices = df['close'].values.reshape(-1, 1)
+    scaled = scaler.fit_transform(prices)
+    X, y = create_sequences(scaled)
+    seq_len = X.shape[1]
+    model = build_lstm_model(input_shape=(seq_len, 1))
+    model.fit(X, y, epochs=EPOCHS, batch_size=BATCH_SIZE)
+    model.save(MODEL_PATH)
+    return model
 
-# 📈 실시간 예측 시퀀스 초기화
-seq = []
-leverage = 100
-stop_loss_pct = 0.01
-position_size = 100
-in_position = False
-entry_price = 0
-position_type = None  # 'long' or 'short'
+def load_model():
+    if not os.path.exists(MODEL_PATH):
+        print("⚠️ 모델 파일이 없습니다. 학습을 수행합니다.")
+        train_model()
+    model = build_lstm_model(input_shape=(WINDOW_SIZE, 1))
+    model.load_weights(MODEL_PATH)
+    df_hist = get_binance_ohlcv(days=90)
+    scaler.fit(df_hist['close'].values.reshape(-1, 1))
+    return model
 
-# 거래 로그 초기화
-log_file = open("trade_log.csv", mode="a", newline="")
-log_writer = csv.writer(log_file)
-log_writer.writerow(["timestamp", "type", "price", "pnl_pct"])
-
-async def realtime_bot():
-    uri = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-    async with websockets.connect(uri) as ws:
-        print("🚀 실시간 LSTM 매매 봇 (롱/숏 포지션 모의 테스트) 실행 중...")
-        global in_position, entry_price, position_type
-
+async def heartbeat(ws):
+    try:
         while True:
-            try:
-                msg = await ws.recv()
-                data = json.loads(msg)
-                price = float(data['p'])
-                ts = datetime.fromtimestamp(data['T'] / 1000.0, tz=timezone.utc).isoformat()
-                seq.append(price)
+            await ws.ping()
+            await asyncio.sleep(PING_INTERVAL_SEC)
+    except asyncio.CancelledError:
+        return
 
-                if len(seq) < 60:
-                    continue
-                if len(seq) > 60:
-                    seq.pop(0)
+async def run_bot():
+    model = load_model()
+    seq = []
+    in_position = False
+    entry_price = 0.0
+    entry_time = None
+    uri = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
 
-                scaled_seq = scaler.transform(np.array(seq).reshape(-1, 1))
-                input_seq = np.expand_dims(scaled_seq, axis=0)
-                pred = model.predict(input_seq, verbose=0)[0][0]
-                pred = scaler.inverse_transform([[pred]])[0][0]
+    while True:
+        try:
+            async with websockets.connect(uri, ping_interval=None, ping_timeout=None) as ws:
+                # TCP Keepalive 설정
+                transport = ws.transport
+                sock = transport.get_extra_info('socket')
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
 
-                expected_pct = (pred - price) / price
+                ping_task = asyncio.create_task(heartbeat(ws))
 
-                if not in_position:
-                    if expected_pct >= 0.0025:
-                        in_position = True
-                        entry_price = price
-                        position_type = 'long'
-                        print(f"✅ LONG 진입 | 진입가: {entry_price:.2f} | 예측가: {pred:.2f} | 기대 수익률: {expected_pct*100:.2f}%")
-                        log_writer.writerow([ts, "BUY_LONG", entry_price, ""])
+                # 로그 파일 열기, UTF-8 BOM 포함
+                with open(LOG_PATH, "a", newline="", encoding="utf-8-sig") as log_file:
+                    log_writer = csv.writer(log_file)
+                    # 헤더: 타임스탬프, 거래유형, 현재가, 예측가, 수익률
+                    log_writer.writerow(["타임스탬프", "거래유형", "현재가", "예측가", "수익률"])
+
+                    print("🚀 연결 성공, 봇 시작")
+                    while True:
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        price = float(data['c'])
+                        ts = datetime.now(timezone.utc).isoformat()
+
+                        # 시퀀스 업데이트
+                        seq.append(price)
+                        if len(seq) > WINDOW_SIZE:
+                            seq.pop(0)
+                        if len(seq) < WINDOW_SIZE:
+                            continue
+
+                        # 기술 지표
+                        short_ma  = np.mean(seq[-SHORT_MA_WINDOW:])
+                        long_ma   = np.mean(seq[-LONG_MA_WINDOW:])
+                        price_std = np.std(seq[-LONG_MA_WINDOW:])
+
+                        # 예측
+                        scaled_seq  = scaler.transform(np.array(seq).reshape(-1, 1))[np.newaxis, ...]
+                        pred_scaled = model.predict(scaled_seq, verbose=0)[0][0]
+                        pred        = scaler.inverse_transform([[pred_scaled]])[0][0]
+                        expected_pct = (pred - price) / price
+
+                        # 동적 임계값 및 모멘텀
+                        vol_pct          = price_std / price
+                        dyn_entry_thresh = ENTRY_THRESHOLD_BASE + vol_pct * 0.003
+                        momentum         = price - seq[-2]
+
+                        # 디버그 로그
+                        print(f"[디버그] 예상수익률={expected_pct*100:.2f}% | 동적임계값={dyn_entry_thresh*100:.2f}% | 모멘텀={momentum:.2f}")
+
+                        # 진입 로직
+                        if not in_position:
+                            if expected_pct > dyn_entry_thresh and momentum > 0:
+                                in_position = True
+                                entry_price, entry_time = price, datetime.now(timezone.utc)
+                                print(f"✅ STRONG ENTRY @ {entry_price:.2f}")
+                                log_writer.writerow([ts, "강력 진입", price, round(pred,2), ""])
+                            elif expected_pct > ENTRY_THRESHOLD_BASE and short_ma > long_ma:
+                                in_position = True
+                                entry_price, entry_time = price, datetime.now(timezone.utc)
+                                print(f"✅ WEAK ENTRY @ {entry_price:.2f}")
+                                log_writer.writerow([ts, "보조 진입", price, round(pred,2), ""])
+                            elif momentum > 0:
+                                in_position = True
+                                entry_price, entry_time = price, datetime.now(timezone.utc)
+                                print(f"✅ MOMENTUM ENTRY @ {entry_price:.2f}")
+                                log_writer.writerow([ts, "모멘텀 진입", price, round(pred,2), ""])
+                            else:
+                                print("🚫 진입 없음")
+                        else:
+                            # 청산 로직
+                            pnl = (price - entry_price) / entry_price - FEE_RATE
+                            hold_min = (datetime.now(timezone.utc) - entry_time).total_seconds()/60
+                            typ = None
+                            if hold_min > MAX_HOLDING_MINUTES:
+                                typ = "시간초과"
+                            elif pnl <= -STOP_LOSS_PCT:
+                                typ = "손절"
+                            elif pnl >= TAKE_PROFIT_PCT:
+                                typ = "익절"
+                            if typ:
+                                print(f"🔔 청산({typ}) @ {price:.2f}, 수익률={pnl*100:.2f}%")
+                                log_writer.writerow([ts, typ, price, round(pred,2), round(pnl*100,2)])
+                                in_position = False
+
                         log_file.flush()
-                    elif expected_pct <= -0.0025:
-                        in_position = True
-                        entry_price = price
-                        position_type = 'short'
-                        print(f"✅ SHORT 진입 | 진입가: {entry_price:.2f} | 예측가: {pred:.2f} | 기대 수익률: {expected_pct*100:.2f}%")
-                        log_writer.writerow([ts, "SELL_SHORT", entry_price, ""])
-                        log_file.flush()
+                ping_task.cancel()
 
-                elif in_position:
-                    if position_type == 'long':
-                        pnl_pct = (price - entry_price) / entry_price
-                    else:
-                        pnl_pct = (entry_price - price) / entry_price
-
-                    if pnl_pct <= -stop_loss_pct:
-                        print(f"❌ 손절 | 현재가: {price:.2f} | 손실률: {pnl_pct*100:.2f}% [{position_type.upper()} 종료]")
-                        log_writer.writerow([ts, f"EXIT_{position_type.upper()}", price, round(pnl_pct * 100, 4)])
-                        log_file.flush()
-                        in_position = False
-                    elif pnl_pct >= 0.005:
-                        print(f"🎉 익절 | 현재가: {price:.2f} | 수익률: {pnl_pct*100:.2f}% [{position_type.upper()} 종료]")
-                        log_writer.writerow([ts, f"EXIT_{position_type.upper()}", price, round(pnl_pct * 100, 4)])
-                        log_file.flush()
-                        in_position = False
-                    else:
-                        print(f"📊 보유 중 | 현재가: {price:.2f} | 수익률: {pnl_pct*100:.2f}% [{position_type.upper()}]")
-
-            except Exception as e:
-                print("❌ 오류 발생:", e)
-                await asyncio.sleep(1)
+        except Exception as e:
+            print("⚠️ 연결 오류, 재시도 중:", e)
+            await asyncio.sleep(RECONNECT_DELAY)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(realtime_bot())
-    finally:
-        log_file.close()
-        # 롱/숏 수익 분석
-        import pandas as pd
-        df = pd.read_csv("trade_log.csv")
-        df = df.dropna()
-        df_long = df[df['type'].str.contains("LONG") & df['type'].str.startswith("EXIT")]
-        df_short = df[df['type'].str.contains("SHORT") & df['type'].str.startswith("EXIT")]
-        long_profit = df_long['pnl_pct'].sum()
-        short_profit = df_short['pnl_pct'].sum()
-        print(f"📊 전략별 총 수익률:")
-        print(f"🔺 롱 수익률 합계: {long_profit:.2f}%")
-        print(f"🔻 숏 수익률 합계: {short_profit:.2f}%")
+    asyncio.run(run_bot())
 

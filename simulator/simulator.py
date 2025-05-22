@@ -3,8 +3,8 @@ import pandas as pd
 import csv
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from lstm_model import build_lstm_model, create_sequences, scaler
-from collector import get_binance_ohlcv
+from model import build_lstm_model, create_sequences, scaler
+from project.collector import get_binance_ohlcv
 import tensorflow as tf
 
 # ✅ 폰트 설정 (맑은 고딕)
